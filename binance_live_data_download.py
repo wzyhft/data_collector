@@ -58,7 +58,19 @@ class DiskWriter(threading.Thread):
             file_handle.close()
 
 def message_handler(_, message):
-    data_cache.put((message['stream'], message['data']))
+    try:
+        # Check if the message is a string
+        if isinstance(message, str):
+            data = json.loads(message)
+            msg_type = data.get('e', 'bbo')
+        else:
+            data = message['data']
+            msg_type = message['stream']
+    except (ValueError, KeyError):
+        logging.error("Invalid message format: %s", message)
+        return
+
+    data_cache.put((msg_type, data))
 
 def persist_data(msg_type: str, json_data):
     data = json.loads(json_data)
