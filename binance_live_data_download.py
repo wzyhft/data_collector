@@ -58,6 +58,7 @@ class DiskWriter(threading.Thread):
             file_handle.close()
 
 def message_handler(_, message):
+    print(message)
     try:
         # Check if the message is a string
         if isinstance(message, str):
@@ -113,6 +114,7 @@ def subscribe_streams(client: ReconnectingWebsocketStreamClient, subscriptions: 
         for config in symbol_configs:
             symbol = config.get('symbol')
             speed = config.get('speed', 1000)
+            level = config.get('level', 20)
             if msg_type == "diff_book_depth":
                 client.diff_book_depth(symbol=symbol, speed=speed)
             elif msg_type == "book_ticker":
@@ -130,12 +132,16 @@ def main():
 
     subscriptions = {
         "depth": [
-            {"symbol": "ethusdt", "speed": 1000},
-            {"symbol": "injusdt", "speed": 1000},
+            {"symbol": "ethusdt", "level": 20},
+            {"symbol": "injusdt", "level": 20},
         ],
         "book_ticker": [
             {"symbol": "injusdt"},
             {"symbol": "ethusdt"},
+        ],
+        "diff_book_depth": [
+            {"symbol": "ethusdt", "speed": 1000},
+            {"symbol": "injusdt", "speed": 1000},
         ],
     }
 
