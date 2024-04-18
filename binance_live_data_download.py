@@ -3,6 +3,7 @@ import logging
 import threading
 from binance.lib.utils import config_logging
 from binance.websocket.spot.websocket_stream import SpotWebsocketStreamClient
+from binance.spot import Spot
 import json
 import csv
 import os
@@ -23,6 +24,7 @@ class DiskWriter(threading.Thread):
         self.start()
 
     def run(self):
+        current_date = None
         while True:
             symbol, msg_type, data = self.queue.get()
             if msg_type is None:  # Stop signal
@@ -34,29 +36,73 @@ class DiskWriter(threading.Thread):
             data['receive_epoch_ms'] = epoch_time_ms
 
             date = receive_time.strftime("%Y-%m-%d")
+            if date != current_date:
+                # Close file handles for the previous date
+                self.close_file_handles()
+                current_date = date
+
             file_name = f"{msg_type}_{symbol}_{date}.csv"
             full_path = os.path.join(STORAGE_PATH, file_name)
 
-            if full_path not in self.file_handles:
-                file_handle = open(full_path, 'a', newline='')
-                writer = csv.DictWriter(file_handle, fieldnames=data.keys())
-                if os.path.getsize(full_path) == 0:
-                    writer.writeheader()
-                self.file_handles[full_path] = (file_handle, writer)
-            else:
-                file_handle, writer = self.file_handles[full_path]
+            try:
+                if full_path not in self.file_handles:
+                    self.file_handles[full_path] = self.open_file_handle(full_path, data.keys())
 
-            writer.writerow(data)
+                file_handle, writer = self.file_handles[full_path]
+                writer.writerow(data)
+
+            except OSError as e:
+                logging.error(f"Error writing to file {full_path}: {e}")
 
             self.queue.task_done()
-
 
     def join(self, timeout=None):
         self.queue.put((None, None, None))
         super().join(timeout)
+        self.close_file_handles()
 
+    def open_file_handle(self, full_path, fieldnames):
+        file_handle = open(full_path, 'a', newline='')
+        writer = csv.DictWriter(file_handle, fieldnames=fieldnames)
+        if os.path.getsize(full_path) == 0:
+            writer.writeheader()
+        return file_handle, writer
+
+    def close_file_handles(self):
         for file_handle, _ in self.file_handles.values():
-            file_handle.close()
+            try:
+                file_handle.close()
+            except OSError as e:
+                logging.error(f"Error closing file: {e}")
+        self.file_handles.clear()
+
+# 47 symbols at most for snapshot within 120 seconds
+class RestApiThread(threading.Thread):
+    def __init__(self, client, subscriptions, queue):
+        super().__init__()
+        self.client = client
+        self.subscriptions = subscriptions.get('snapshot', [])  # Get the 'snapshot' list directly
+        self.queue = queue
+        self.daemon = True  # Make the thread a daemon thread
+
+    def run(self):
+        while True:
+            start_time = time.time()
+            for config in self.subscriptions:  # Iterate over the 'snapshot' list directly
+                symbol = config.get('symbol').upper()
+                level = config.get('level', 1000)
+                snapshot_resp = self.client.depth(symbol, limit=level)
+                if 'code' in snapshot_resp:
+                    logging.error(f"Error in snapshot response for {symbol}: {snapshot_resp}")
+                else:
+                    self.queue.put((symbol, 'snapshot', snapshot_resp))
+                elapsed_time = time.time() - start_time
+                wait_time = max(0, 3 - (elapsed_time % 3))
+                time.sleep(wait_time)
+
+            cycle_duration = time.time() - start_time
+            if cycle_duration < 120:
+                time.sleep(120 - cycle_duration)
 
 def extract_components(stream_value):
     # 1. (\w+): Matches the symbol part
@@ -85,8 +131,8 @@ class MessageProcessor:
         try:
             data = json.loads(message)
             logging.debug(f'Processing message: {data}')
-            if "result" in data and data["result"]:
-                logging.info(f'Subscriptions: {data["result"]}')
+            if "result" in data and data["id"]:
+                logging.info(f'Subscriptions: {data["id"]}')
             elif "data" in data:
                 components = extract_components(data['stream'])
                 sym = components['symbol']
@@ -148,32 +194,14 @@ def batch_subscribe(client: ReconnectingWebsocketStreamClient, subscriptions: Di
         if i + batch_size < len(all_requests):  # Prevent sleeping after the last batch
             time.sleep(delay)
 
-
-def subscribe_streams(client: ReconnectingWebsocketStreamClient, subscriptions: Dict[str, List[Dict]]):
-    sub_id = 4
-    for msg_type, symbol_configs in subscriptions.items():
-        for config in symbol_configs:
-            symbol = config.get('symbol')
-            speed = config.get('speed', 1000)
-            level = config.get('level', 20)
-            if msg_type == "diff_book_depth":
-                client.diff_book_depth(symbol=symbol, speed=speed, id=sub_id)
-            elif msg_type == "book_ticker":
-                client.book_ticker(symbol=symbol, id = sub_id)
-            elif msg_type == "depth":
-                client.partial_book_depth(symbol=symbol, level=20, speed=100, id=sub_id)
-            sub_id += 1
-            # Add more message types here
-
 def main():
     config_logging(logging, logging.INFO, log_file='downloader.log')
     global data_cache
     data_cache = queue.Queue(maxsize=CACHE_SIZE)
     disk_writer = DiskWriter(data_cache)
-    # client = ReconnectingWebsocketStreamClient(on_message=message_handler, stream_url="wss://stream.binance.com:443", is_combined=True)
 
     message_processor = MessageProcessor(data_cache)
-    client = ReconnectingWebsocketStreamClient(
+    spot_ws_client = ReconnectingWebsocketStreamClient(
         on_message=message_processor.handle_message,
         stream_url="wss://stream.binance.com:443",
         is_combined=True
@@ -189,24 +217,31 @@ def main():
             {"symbol": "ethusdt"},
         ],
         "diff_book_depth": [
-            {"symbol": "ethusdt", "speed": 1000},
-            {"symbol": "injusdt", "speed": 1000},
+            {"symbol": "ethusdt", "speed": 100},
+            {"symbol": "injusdt", "speed": 100},
+        ],
+        "snapshot": [
+            {"symbol": "ethusdt", "level": 1000},
+            {"symbol": "injusdt", "level": 1000},
         ],
     }
 
-    #subscribe_streams(client, subscriptions)
-    batch_subscribe(client, subscriptions, batch_size=5, delay=2)
+    batch_subscribe(spot_ws_client, subscriptions, batch_size=5, delay=2)
+
+    spot_rest_client = Spot()
+    rest_api_thread = RestApiThread(spot_rest_client, subscriptions, data_cache)
+    rest_api_thread.start()
 
     while True:
         try:
             time.sleep(1)
         except KeyboardInterrupt:
-            client.should_reconnect = False
+            spot_ws_client.should_reconnect = False
             break
 
     logging.debug("Closing WebSocket connection")
     disk_writer.join()
-    client.stop()
+    spot_ws_client.stop()
 
 
 if __name__ == "__main__":
